@@ -271,9 +271,13 @@ class TaskWorker(QThread):
         cancelled = False
         rows = []
         temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+        processed_photos = []
+
+        status_counts = {}
+        tag_summary = {}
 
         for i, photo in enumerate(photos):
-            rows.append({
+            row = {
                 "文件名": photo.filename,
                 "路径": str(photo.file_path),
                 "尺寸": photo.dimensions_str,
@@ -281,8 +285,16 @@ class TaskWorker(QThread):
                 "大小(MB)": photo.size_mb,
                 "状态": photo.status.value,
                 "标签": ", ".join(photo.tags),
-            })
+            }
+            rows.append(row)
             completed.append(photo.filename)
+            processed_photos.append(photo)
+
+            status_key = photo.status.value
+            status_counts[status_key] = status_counts.get(status_key, 0) + 1
+            for tag in photo.tags:
+                tag_summary[tag] = tag_summary.get(tag, 0) + 1
+
             self._emit_progress(i + 1, total)
 
             if i < total - 1:
@@ -290,13 +302,16 @@ class TaskWorker(QThread):
                     cancelled = True
                     skipped.extend([p.filename for p in photos[i + 1:]])
                     rows = rows[:i + 1]
+                    processed_photos = processed_photos[:i + 1]
                     break
                 if not self._check_pause():
                     cancelled = True
                     skipped.extend([p.filename for p in photos[i + 1:]])
                     rows = rows[:i + 1]
+                    processed_photos = processed_photos[:i + 1]
                     break
 
+        final_path = ""
         if rows and not cancelled:
             try:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,6 +324,7 @@ class TaskWorker(QThread):
                     with open(temp_path, "w", encoding="utf-8") as f:
                         json.dump(rows, f, ensure_ascii=False, indent=2)
                 temp_path.rename(output_path)
+                final_path = str(output_path)
             except Exception as e:
                 if temp_path.exists():
                     try:
@@ -324,12 +340,15 @@ class TaskWorker(QThread):
                     pass
 
         return {
-            "manifest_path": str(output_path) if not cancelled and rows else "",
+            "manifest_path": final_path,
+            "output_directory": str(output_path.parent) if final_path else "",
             "count": len(rows),
+            "total": total,
             "completed": completed,
             "skipped": skipped,
             "cancelled": cancelled,
-            "total": total,
+            "status_counts": status_counts,
+            "tag_summary": tag_summary,
         }
 
     def _do_detect_duplicates(self) -> dict:

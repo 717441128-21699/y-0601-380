@@ -6,13 +6,14 @@ from PySide6.QtCore import QObject, Signal
 
 class UndoEntry:
     def __init__(self, entry_id: str, description: str, undo_action: Callable,
-                 affected_count: int = 0, timestamp: datetime = None):
+                 affected_count: int = 0, timestamp: datetime = None, extra_data: dict = None):
         self.entry_id = entry_id
         self.description = description
         self.undo_action = undo_action
         self.affected_count = affected_count
         self.timestamp = timestamp or datetime.now()
         self.applied = True
+        self.extra_data = extra_data or {}
 
 
 class UndoManager(QObject):
@@ -24,13 +25,14 @@ class UndoManager(QObject):
         self._undo_stack: deque = deque(maxlen=max_size)
         self._entry_counter = 0
 
-    def push(self, description: str, undo_action: Callable, affected_count: int = 0) -> str:
+    def push(self, description: str, undo_action: Callable, affected_count: int = 0, extra_data: dict = None) -> str:
         self._entry_counter += 1
         entry = UndoEntry(
             entry_id=f"undo_{self._entry_counter}",
             description=description,
             undo_action=undo_action,
             affected_count=affected_count,
+            extra_data=extra_data,
         )
         self._undo_stack.append(entry)
         self.stack_changed.emit(len(self._undo_stack))

@@ -1,6 +1,8 @@
+import os
+import sys
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
                                QFrame, QListWidget, QListWidgetItem, QProgressBar, QSplitter,
-                               QTextEdit, QTreeWidget, QTreeWidgetItem, QHeaderView)
+                               QTextEdit, QTreeWidget, QTreeWidgetItem, QHeaderView, QMessageBox)
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QIcon, QAction, QBrush, QColor
 from modules.task_queue import TaskManager
@@ -12,11 +14,13 @@ class TaskQueuePanel(QWidget):
     control_requested = Signal(str)
     undo_requested = Signal()
     undo_to_index = Signal(int)
+    retry_task = Signal(str, bool)
 
     def __init__(self, task_manager: TaskManager, undo_manager: UndoManager, parent=None):
         super().__init__(parent)
         self.tm = task_manager
         self.um = undo_manager
+        self._current_selected_undo_entry = None
         self._init_ui()
         self._connect_signals()
 
@@ -81,9 +85,25 @@ class TaskQueuePanel(QWidget):
         detail_layout = QVBoxLayout(detail_frame)
         detail_layout.setContentsMargins(8, 8, 8, 8)
 
+        detail_header_layout = QHBoxLayout()
         detail_header = QLabel("任务详情")
         detail_header.setStyleSheet("font-weight: bold; color: #333; padding: 4px;")
-        detail_layout.addWidget(detail_header)
+        detail_header_layout.addWidget(detail_header)
+        detail_header_layout.addStretch()
+
+        self.btn_retry_full = QPushButton("🔄 重试全部")
+        self.btn_retry_full.setStyleSheet(self._btn_style("#8e44ad"))
+        self.btn_retry_full.setVisible(False)
+        self.btn_retry_full.clicked.connect(self._retry_full)
+        detail_header_layout.addWidget(self.btn_retry_full)
+
+        self.btn_retry_skipped = QPushButton("⚠ 重跑跳过项")
+        self.btn_retry_skipped.setStyleSheet(self._btn_style("#e67e22"))
+        self.btn_retry_skipped.setVisible(False)
+        self.btn_retry_skipped.clicked.connect(self._retry_skipped)
+        detail_header_layout.addWidget(self.btn_retry_skipped)
+
+        detail_layout.addLayout(detail_header_layout)
 
         self.lbl_task_name = QLabel("选择任务查看详情")
         self.lbl_task_name.setStyleSheet("font-weight: bold; font-size: 13px;")
@@ -109,6 +129,49 @@ class TaskQueuePanel(QWidget):
         self.lbl_task_desc.setStyleSheet("color: #666; font-size: 11px;")
         detail_layout.addWidget(self.lbl_task_desc)
 
+        self.delivery_frame = QFrame()
+        self.delivery_frame.setStyleSheet("QFrame { background: #eaf6f0; border: 1px solid #27ae60; border-radius: 6px; }")
+        delivery_layout = QVBoxLayout(self.delivery_frame)
+        delivery_layout.setContentsMargins(10, 8, 10, 8)
+        delivery_layout.setSpacing(4)
+
+        delivery_title_layout = QHBoxLayout()
+        self.lbl_delivery_title = QLabel("📦 交付包视图")
+        self.lbl_delivery_title.setStyleSheet("font-weight: bold; color: #27ae60; font-size: 12px;")
+        delivery_title_layout.addWidget(self.lbl_delivery_title)
+        delivery_title_layout.addStretch()
+
+        self.btn_open_output_dir = QPushButton("📂 打开目录")
+        self.btn_open_output_dir.setStyleSheet("""
+            QPushButton {
+                background: #27ae60; color: white; border: none;
+                padding: 4px 10px; border-radius: 4px; font-size: 11px;
+            }
+            QPushButton:hover { background: #219a52; }
+        """)
+        self.btn_open_output_dir.clicked.connect(self._open_output_directory)
+        delivery_title_layout.addWidget(self.btn_open_output_dir)
+
+        delivery_layout.addLayout(delivery_title_layout)
+
+        self.lbl_delivery_counts = QLabel("")
+        self.lbl_delivery_counts.setWordWrap(True)
+        self.lbl_delivery_counts.setStyleSheet("color: #2c3e50; font-size: 11px;")
+        delivery_layout.addWidget(self.lbl_delivery_counts)
+
+        self.lbl_delivery_tags = QLabel("")
+        self.lbl_delivery_tags.setWordWrap(True)
+        self.lbl_delivery_tags.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+        delivery_layout.addWidget(self.lbl_delivery_tags)
+
+        self.lbl_delivery_path = QLabel("")
+        self.lbl_delivery_path.setWordWrap(True)
+        self.lbl_delivery_path.setStyleSheet("color: #3498db; font-size: 10px; text-decoration: underline;")
+        delivery_layout.addWidget(self.lbl_delivery_path)
+
+        self.delivery_frame.setVisible(False)
+        detail_layout.addWidget(self.delivery_frame)
+
         self.lbl_task_summary = QLabel("")
         self.lbl_task_summary.setWordWrap(True)
         self.lbl_task_summary.setStyleSheet("color: #333; font-size: 11px; padding: 6px; background: #f8f9fa; border-radius: 4px;")
@@ -124,7 +187,7 @@ class TaskQueuePanel(QWidget):
             QTreeWidget::item { padding: 2px 0; }
         """)
         self.result_tree.setVisible(False)
-        self.result_tree.setMaximumHeight(220)
+        self.result_tree.setMaximumHeight(260)
         detail_layout.addWidget(self.result_tree)
 
         self.error_label = QLabel("")
@@ -144,7 +207,7 @@ class TaskQueuePanel(QWidget):
         undo_layout.setContentsMargins(8, 8, 8, 8)
 
         undo_header_layout = QHBoxLayout()
-        undo_header = QLabel("↩ 撤销历史")
+        undo_header = QLabel("↩ 撤销历史 (时间线)")
         undo_header.setStyleSheet("font-weight: bold; color: #333; padding: 4px;")
         undo_header_layout.addWidget(undo_header)
         undo_header_layout.addStretch()
@@ -163,14 +226,42 @@ class TaskQueuePanel(QWidget):
 
         undo_layout.addLayout(undo_header_layout)
 
+        undo_splitter = QSplitter(Qt.Horizontal)
+
         self.undo_list = QListWidget()
         self.undo_list.setStyleSheet("""
             QListWidget { border: 1px solid #e5e5e5; border-radius: 4px; background: #fafafa; }
             QListWidget::item { padding: 6px 8px; border-bottom: 1px solid #f0f0f0; }
             QListWidget::item:selected { background: #4A90D9; color: white; }
         """)
-        undo_layout.addWidget(self.undo_list)
-        undo_frame.setMaximumHeight(200)
+        self.undo_list.itemSelectionChanged.connect(self._on_undo_selection)
+        undo_splitter.addWidget(self.undo_list)
+
+        self.undo_detail_frame = QFrame()
+        self.undo_detail_frame.setStyleSheet("QFrame { background: #f8f9fa; border: 1px solid #e5e5e5; border-radius: 4px; }")
+        undo_detail_layout = QVBoxLayout(self.undo_detail_frame)
+        undo_detail_layout.setContentsMargins(8, 8, 8, 8)
+        undo_detail_layout.setSpacing(4)
+
+        self.lbl_undo_detail_title = QLabel("点击左侧条目查看详情")
+        self.lbl_undo_detail_title.setStyleSheet("font-weight: bold; color: #555; font-size: 11px;")
+        undo_detail_layout.addWidget(self.lbl_undo_detail_title)
+
+        self.undo_detail_tree = QTreeWidget()
+        self.undo_detail_tree.setHeaderLabels(["变更项", "变更前 → 变更后"])
+        self.undo_detail_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.undo_detail_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.undo_detail_tree.setStyleSheet("""
+            QTreeWidget { border: none; background: transparent; font-size: 10px; }
+            QTreeWidget::item { padding: 1px 0; }
+        """)
+        undo_detail_layout.addWidget(self.undo_detail_tree, 1)
+
+        undo_splitter.addWidget(self.undo_detail_frame)
+        undo_splitter.setStretchFactor(0, 1)
+        undo_splitter.setStretchFactor(1, 1)
+        undo_splitter.setSizes([160, 160])
+        undo_layout.addWidget(undo_splitter, 1)
 
         splitter_main.addWidget(undo_frame)
         splitter_main.setStretchFactor(0, 3)
@@ -293,6 +384,8 @@ class TaskQueuePanel(QWidget):
         self.lbl_task_time.setText(time_info)
         self.lbl_task_desc.setText(task.description if task.description else "(无描述)")
 
+        self._render_delivery_view(task)
+        self._render_retry_buttons(task)
         self._render_result_summary(task)
         self._render_result_tree(task)
 
@@ -301,6 +394,96 @@ class TaskQueuePanel(QWidget):
             self.error_label.setText(f"❌ 失败原因:\n{task.error_message}")
         else:
             self.error_label.setVisible(False)
+
+    def _render_delivery_view(self, task: Task):
+        result = task.result
+        if task.task_type != TaskType.GENERATE_MANIFEST or not result or not isinstance(result, dict):
+            self.delivery_frame.setVisible(False)
+            return
+
+        manifest_path = result.get("manifest_path", "")
+        output_dir = result.get("output_directory", "")
+        status_counts = result.get("status_counts", {})
+        tag_summary = result.get("tag_summary", {})
+        total = result.get("total", 0)
+        count = result.get("count", 0)
+
+        if not manifest_path and task.status == TaskStatus.CANCELLED:
+            self.delivery_frame.setVisible(False)
+            return
+
+        self.delivery_frame.setVisible(True)
+
+        counts_parts = [f"📊 照片总数: {total} (已列入清单 {count})"]
+        for status_name, status_count in status_counts.items():
+            status_emoji = {"保留": "✓", "淘汰": "✗", "未处理": "○", "重复": "⚠"}
+            emoji = status_emoji.get(status_name, "")
+            counts_parts.append(f"{emoji} {status_name}: {status_count}")
+        self.lbl_delivery_counts.setText("　".join(counts_parts))
+
+        if tag_summary:
+            sorted_tags = sorted(tag_summary.items(), key=lambda x: -x[1])
+            tag_strs = [f"🏷 {tag}×{cnt}" for tag, cnt in sorted_tags[:10]]
+            if len(sorted_tags) > 10:
+                tag_strs.append(f"... 共{len(sorted_tags)}种标签")
+            self.lbl_delivery_tags.setText("　".join(tag_strs))
+        else:
+            self.lbl_delivery_tags.setText("🏷 无标签")
+
+        if manifest_path:
+            self.lbl_delivery_path.setText(f"📄 清单文件: {manifest_path}")
+            self.lbl_delivery_path.setVisible(True)
+        else:
+            self.lbl_delivery_path.setText("🚫 清单未生成 (任务已取消)")
+            self.lbl_delivery_path.setVisible(True)
+
+        self.btn_open_output_dir.setEnabled(bool(output_dir))
+        self._current_output_dir = output_dir
+        self._current_manifest_path = manifest_path
+
+    def _render_retry_buttons(self, task: Task):
+        can_retry = task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+        can_retry_skipped = can_retry and task.task_type in (
+            TaskType.RENAME, TaskType.MOVE, TaskType.COMPRESS, TaskType.GENERATE_MANIFEST
+        )
+        self.btn_retry_full.setVisible(can_retry)
+        self.btn_retry_skipped.setVisible(can_retry_skipped)
+        self._current_task_id = task.task_id
+
+    def _retry_full(self):
+        if hasattr(self, "_current_task_id"):
+            reply = QMessageBox.question(
+                self, "重试任务",
+                "确定要完整重试这个任务吗？\n已完成的项目也会重新处理。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.retry_task.emit(self._current_task_id, False)
+
+    def _retry_skipped(self):
+        if hasattr(self, "_current_task_id"):
+            reply = QMessageBox.question(
+                self, "重跑跳过项",
+                "只重新处理跳过和取消的项目？\n已成功完成的部分不会重复处理。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self.retry_task.emit(self._current_task_id, True)
+
+    def _open_output_directory(self):
+        import subprocess
+        path = getattr(self, "_current_output_dir", "")
+        if not path:
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path])
+            else:
+                subprocess.run(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开目录: {e}")
 
     def _render_result_summary(self, task: Task):
         result = task.result
@@ -349,10 +532,9 @@ class TaskQueuePanel(QWidget):
             has_content = True
             completed_item = QTreeWidgetItem(self.result_tree, [f"✅ 已打标签 ({len(result['completed'])})", f"标签: {', '.join(result.get('applied_tags', []))}"])
             for item_data in result["completed"]:
-                QTreeWidgetItem(completed_item, [
-                    item_data.get("filename", ""),
-                    f"+{', '.join(item_data.get('added', []))}  (之前: {', '.join(item_data.get('old_tags', [])) or '无'})"
-                ])
+                old = ", ".join(item_data.get("old_tags", [])) or "(无)"
+                new = ", ".join(item_data.get("new_tags", [])) or "(无)"
+                QTreeWidgetItem(completed_item, [item_data.get("filename", ""), f"{old}  →  {new}"])
         elif task.task_type == TaskType.DETECT_DUPLICATES and result.get("groups_detail"):
             has_content = True
             for group in result["groups_detail"]:
@@ -371,11 +553,14 @@ class TaskQueuePanel(QWidget):
                 QTreeWidgetItem(deleted_item, [item_data.get("filename", ""), item_data.get("path", "")])
         elif task.task_type == TaskType.GENERATE_MANIFEST:
             has_content = True
-            info_item = QTreeWidgetItem(self.result_tree, ["📄 交付清单", result.get("manifest_path", "")])
+            if result.get("cancelled") and not result.get("manifest_path"):
+                info_item = QTreeWidgetItem(self.result_tree, ["🚫 清单未生成", "任务已取消，无最终文件"])
+            else:
+                info_item = QTreeWidgetItem(self.result_tree, ["📄 交付清单", result.get("manifest_path", "") or "(未生成)"])
             if result.get("completed"):
-                files_item = QTreeWidgetItem(info_item, [f"包含文件 ({len(result['completed'])})", ""])
+                files_item = QTreeWidgetItem(info_item, [f"已列入清单 ({len(result['completed'])})", ""])
                 for fname in result["completed"][:50]:
-                    QTreeWidgetItem(files_item, [fname, ""])
+                    QTreeWidgetItem(files_item, [fname, "✓ 已处理"])
                 if len(result["completed"]) > 50:
                     QTreeWidgetItem(files_item, [f"... 还有 {len(result['completed']) - 50} 个", ""])
         elif task.task_type == TaskType.BATCH and result.get("sub_results"):
@@ -398,6 +583,41 @@ class TaskQueuePanel(QWidget):
         if has_content:
             self.result_tree.expandToDepth(0)
 
+    def _on_undo_selection(self):
+        row = self.undo_list.currentRow()
+        if row < 0:
+            self.lbl_undo_detail_title.setText("点击左侧条目查看详情")
+            self.undo_detail_tree.clear()
+            return
+
+        history = self.um.history
+        if row >= len(history):
+            return
+
+        entry = history[row]
+        self._current_selected_undo_entry = entry
+        self.lbl_undo_detail_title.setText(f"⏪ {entry.timestamp.strftime('%H:%M:%S')}  {entry.description}")
+
+        self.undo_detail_tree.clear()
+        extra = getattr(entry, "extra_data", None)
+        if extra and isinstance(extra, dict):
+            changes = extra.get("changes", [])
+            for change in changes:
+                if isinstance(change, dict):
+                    name = change.get("name", "")
+                    before = str(change.get("before", ""))
+                    after = str(change.get("after", ""))
+                    QTreeWidgetItem(self.undo_detail_tree, [name, f"{before}  →  {after}"])
+                else:
+                    QTreeWidgetItem(self.undo_detail_tree, [str(change), ""])
+            if not changes:
+                count = entry.affected_count or "(未知)"
+                QTreeWidgetItem(self.undo_detail_tree, [f"共影响 {count} 项", "点击上方按钮可执行回滚"])
+        else:
+            count = entry.affected_count or "(未知)"
+            QTreeWidgetItem(self.undo_detail_tree, [f"共影响 {count} 项", "点击上方按钮可执行回滚"])
+        self.undo_detail_tree.expandAll()
+
     def _refresh_undo_history(self):
         self.undo_list.clear()
         for entry in self.um.history:
@@ -409,6 +629,7 @@ class TaskQueuePanel(QWidget):
             self.undo_list.addItem(item)
         self.btn_undo_last.setEnabled(self.um.can_undo())
         self.btn_undo_to.setEnabled(self.um.can_undo())
+        self._on_undo_selection()
 
     def _undo_to_selected(self):
         row = self.undo_list.currentRow()
