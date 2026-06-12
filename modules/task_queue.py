@@ -19,6 +19,7 @@ class TaskWorker(QThread):
     task_progress = Signal(str, int, int)
     task_completed = Signal(str, object)
     task_failed = Signal(str, str)
+    task_cancelled = Signal(str)
     log = Signal(str, str)
 
     def __init__(self, task: Task):
@@ -71,13 +72,18 @@ class TaskWorker(QThread):
             elif self.task.task_type == TaskType.BATCH:
                 result = self._do_batch()
 
-            if not self._check_pause():
+            was_cancelled = False
+            with QMutexLocker(self._mutex):
+                was_cancelled = self._cancelled
+
+            if was_cancelled:
                 self.task.status = TaskStatus.CANCELLED
+                self.task_cancelled.emit(self.task.task_id)
             else:
                 self.task.status = TaskStatus.COMPLETED
                 self.task.completed_at = datetime.now()
                 self.task.result = result
-            self.task_completed.emit(self.task.task_id, result)
+                self.task_completed.emit(self.task.task_id, result)
         except Exception as e:
             self.task.status = TaskStatus.FAILED
             self.task.error_message = str(e)
@@ -329,6 +335,7 @@ class TaskManager(QObject):
         worker.task_progress.connect(self._on_progress)
         worker.task_completed.connect(self._on_completed)
         worker.task_failed.connect(self._on_failed)
+        worker.task_cancelled.connect(self._on_cancelled)
         worker.log.connect(lambda lvl, msg: self._bus.log_message.emit(lvl, msg))
         self._current_worker = worker
         task.status = TaskStatus.RUNNING
@@ -364,6 +371,16 @@ class TaskManager(QObject):
             self.task_updated.emit(task)
             self._bus.task_failed.emit(task)
             self._bus.log_message.emit("error", f"任务失败: {task.name} - {error}")
+        self._current_worker = None
+        self._process_queue()
+
+    def _on_cancelled(self, task_id: str):
+        task = self._tasks.get(task_id)
+        if task:
+            task.status = TaskStatus.CANCELLED
+            self.task_updated.emit(task)
+            self._bus.task_updated.emit(task)
+            self._bus.log_message.emit("warning", f"任务已取消: {task.name}")
         self._current_worker = None
         self._process_queue()
 

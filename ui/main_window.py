@@ -36,6 +36,7 @@ class MainWindow(QMainWindow):
         self.tm = TaskManager()
         self.undo_mgr = UndoManager()
         self.bus = EventBus.instance()
+        self._pending_undo: dict = {}
 
         self._build_ui()
         self._build_toolbar()
@@ -189,6 +190,11 @@ class MainWindow(QMainWindow):
 
         self.undo_mgr.stack_changed.connect(self._on_undo_changed)
 
+        self.tm.task_updated.connect(self._on_task_updated)
+        self.bus.task_completed.connect(self._on_task_completed)
+        self.bus.task_failed.connect(self._on_task_failed)
+        self.bus.photo_tags_changed.connect(self._on_photo_tags_changed)
+
     def _apply_stylesheet(self):
         self.setStyleSheet("""
             QMainWindow { background: #f5f6f8; }
@@ -286,19 +292,54 @@ class MainWindow(QMainWindow):
         photos = self.thumb_grid.selected_photos or self.store.all_photos
         if not photos:
             return
-        for p in photos:
-            old = p.status
+        old_states = [(p, p.status) for p in photos]
+        for p, old in old_states:
             self.store.update_photo_status(p, status)
             self.thumb_grid.refresh_photo(p)
         if self.detail_panel._photo:
             self.detail_panel.refresh()
-        self._push_undo_status(photos, status)
+        self._push_undo_status(old_states, status)
 
-    def _on_photo_status_changed(self, photo: Photo, old_status):
-        self.store.update_photo_status(photo, old_status if False else None)
+    def _on_photo_status_changed(self, photo: Photo, new_status: PhotoStatus):
+        old_status = photo.status
+        if old_status == new_status:
+            return
+        self.store.update_photo_status(photo, new_status)
         self.thumb_grid.refresh_photo(photo)
         self.detail_panel.refresh()
         self.filter_panel.refresh_stats()
+        self._push_undo_status([(photo, old_status)], new_status)
+
+    def _on_photo_tags_changed(self, photo: Photo, new_tags: list):
+        self.thumb_grid.refresh_photo(photo)
+        self.detail_panel.refresh()
+        self.filter_panel.refresh_tags()
+
+    def _on_task_updated(self, task: Task):
+        pass
+
+    def _on_task_completed(self, task: Task):
+        pending = self._pending_undo.pop(task.task_id, None)
+        if pending and task.result:
+            if pending["type"] == "rename":
+                rename_map = task.result.get("rename_map", {})
+                if rename_map:
+                    self._push_undo_rename(rename_map)
+            elif pending["type"] == "tags":
+                photos = [p for p, _ in pending["old_states"]]
+                self._push_undo_tags(photos, pending["tags"])
+            elif pending["type"] == "move":
+                move_map = task.result.get("move_map", {})
+                if move_map:
+                    self._push_undo_move(move_map)
+
+        if task.task_type in (TaskType.DETECT_DUPLICATES, TaskType.RENAME, TaskType.APPLY_TAGS,
+                              TaskType.MOVE, TaskType.DELETE_REJECT, TaskType.BATCH):
+            self.store.photos_changed.emit()
+            self.bus.log_message.emit("success", f"任务完成: {task.name}")
+
+    def _on_task_failed(self, task: Task):
+        pass
 
     def _on_selection_changed(self, selected: list):
         self.rename_tag_panel.set_selected_photos(selected)
@@ -306,6 +347,7 @@ class MainWindow(QMainWindow):
         self.lbl_count.setText(f"共 {self.store.count} 张照片 | 选中 {len(selected)} 张")
 
     def _on_rename_request(self, pattern: str, photos: list):
+        old_states = [(p, str(p.file_path)) for p in photos]
         task = self.tm.create_task(
             TaskType.RENAME,
             f"批量重命名 ({len(photos)}张)",
@@ -313,10 +355,12 @@ class MainWindow(QMainWindow):
             {"pattern": pattern, "photos": photos},
             can_undo=True,
         )
+        self._pending_undo[task.task_id] = {"type": "rename", "old_states": old_states}
         self.tm.enqueue_task(task)
         self.right_tabs.setCurrentIndex(1)
 
     def _on_tags_request(self, tags: list, photos: list):
+        old_states = [(p, list(p.tags)) for p in photos]
         task = self.tm.create_task(
             TaskType.APPLY_TAGS,
             f"添加标签 ({len(photos)}张)",
@@ -324,6 +368,7 @@ class MainWindow(QMainWindow):
             {"tags": tags, "photos": photos},
             can_undo=True,
         )
+        self._pending_undo[task.task_id] = {"type": "tags", "old_states": old_states, "tags": tags}
         self.tm.enqueue_task(task)
         self.right_tabs.setCurrentIndex(1)
 
@@ -343,6 +388,9 @@ class MainWindow(QMainWindow):
             params,
             can_undo=(action == "move"),
         )
+        if action == "move":
+            old_states = [(p, str(p.file_path)) for p in params.get("photos", [])]
+            self._pending_undo[task.task_id] = {"type": "move", "old_states": old_states}
         self.tm.enqueue_task(task)
         self.right_tabs.setCurrentIndex(1)
 
@@ -378,12 +426,49 @@ class MainWindow(QMainWindow):
     def _on_undo_changed(self, count: int):
         self.task_panel.set_undo_enabled(count > 0, self.undo_mgr.last_description())
 
-    def _push_undo_status(self, photos: list, new_status: PhotoStatus):
-        old_states = [(p, p.status) for p in photos]
+    def _push_undo_status(self, old_states: list, new_status: PhotoStatus):
         def undo():
             for p, s in old_states:
                 p.status = s
-        self.undo_mgr.push(f"设置{len(photos)}张照片为{new_status.value}", undo)
+            self._refresh_all()
+        self.undo_mgr.push(f"设置{len(old_states)}张照片为{new_status.value}", undo)
+
+    def _push_undo_tags(self, photos: list, added_tags: list):
+        old_states = [(p, list(p.tags)) for p in photos]
+        def undo():
+            for p, old_tags in old_states:
+                p.tags = list(old_tags)
+            self._refresh_all()
+        self.undo_mgr.push(f"为{len(photos)}张照片添加标签: {', '.join(added_tags)}", undo)
+
+    def _push_undo_rename(self, rename_map: dict):
+        def undo():
+            for old_path, new_path in list(rename_map.items()):
+                from pathlib import Path
+                if Path(new_path).exists():
+                    Path(new_path).rename(old_path)
+                    photo = self.store.get_photo(new_path)
+                    if photo:
+                        photo.file_path = Path(old_path)
+                        photo.filename = Path(old_path).name
+                        self.store._photos[old_path] = self.store._photos.pop(new_path, photo)
+            self._refresh_all()
+        self.undo_mgr.push(f"撤销{len(rename_map)}个文件重命名", undo)
+
+    def _push_undo_move(self, move_map: dict):
+        def undo():
+            from pathlib import Path
+            import shutil
+            for old_path, new_path in list(move_map.items()):
+                if Path(new_path).exists():
+                    shutil.move(new_path, old_path)
+                    photo = self.store.get_photo(new_path)
+                    if photo:
+                        photo.file_path = Path(old_path)
+                        photo.filename = Path(old_path).name
+                        self.store._photos[old_path] = self.store._photos.pop(new_path, photo)
+            self._refresh_all()
+        self.undo_mgr.push(f"撤销{len(move_map)}个文件移动", undo)
 
     def _apply_rule(self, rule: HistoryRule):
         from PySide6.QtWidgets import QMessageBox
