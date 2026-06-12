@@ -26,10 +26,15 @@ class PhotoStore(QObject):
 
     def add_photos(self, photos: List[Photo]):
         for p in photos:
-            self._photos[p.file_path] = p
+            self._photos[str(p.file_path)] = p
         self.photos_changed.emit()
         self._bus.photos_imported.emit(photos)
         self._bus.log_message.emit("info", f"已导入 {len(photos)} 张照片")
+
+    def update_photo_path(self, photo: Photo, old_path: str, new_path: str):
+        if old_path in self._photos:
+            del self._photos[old_path]
+        self._photos[new_path] = photo
 
     def clear(self):
         self._photos.clear()

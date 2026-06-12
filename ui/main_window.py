@@ -98,7 +98,7 @@ class MainWindow(QMainWindow):
         self.right_tabs.setTabPosition(QTabWidget.East)
 
         self.detail_panel = PhotoDetailPanel()
-        self.task_panel = TaskQueuePanel(self.tm)
+        self.task_panel = TaskQueuePanel(self.tm, self.undo_mgr)
 
         self.right_tabs.addTab(self.detail_panel, "🖼 详情")
         self.right_tabs.addTab(self.task_panel, "📋 任务队列")
@@ -172,6 +172,7 @@ class MainWindow(QMainWindow):
         self.batch_panel.batch_requested.connect(self._on_batch_request)
         self.task_panel.control_requested.connect(self._task_control)
         self.task_panel.undo_requested.connect(self._do_undo)
+        self.task_panel.undo_to_index.connect(self._do_undo_to_index)
         self.history_panel.rule_applied.connect(self._apply_rule)
         self.history_panel.capture_requested.connect(self._capture_rule)
 
@@ -324,6 +325,10 @@ class MainWindow(QMainWindow):
             if pending["type"] == "rename":
                 rename_map = task.result.get("rename_map", {})
                 if rename_map:
+                    for old_path, new_path in rename_map.items():
+                        photo = self.store.get_photo(old_path)
+                        if photo:
+                            self.store.update_photo_path(photo, old_path, new_path)
                     self._push_undo_rename(rename_map)
             elif pending["type"] == "tags":
                 photos = [p for p, _ in pending["old_states"]]
@@ -331,6 +336,10 @@ class MainWindow(QMainWindow):
             elif pending["type"] == "move":
                 move_map = task.result.get("move_map", {})
                 if move_map:
+                    for old_path, new_path in move_map.items():
+                        photo = self.store.get_photo(old_path)
+                        if photo:
+                            self.store.update_photo_path(photo, old_path, new_path)
                     self._push_undo_move(move_map)
 
         if task.task_type in (TaskType.DETECT_DUPLICATES, TaskType.RENAME, TaskType.APPLY_TAGS,
@@ -423,6 +432,12 @@ class MainWindow(QMainWindow):
             self.bus.log_message.emit("success", f"已撤销: {desc}")
             self._refresh_all()
 
+    def _do_undo_to_index(self, index: int):
+        count = self.undo_mgr.undo_to_index(index)
+        if count > 0:
+            self.bus.log_message.emit("success", f"已回滚 {count} 步操作")
+            self._refresh_all()
+
     def _on_undo_changed(self, count: int):
         self.task_panel.set_undo_enabled(count > 0, self.undo_mgr.last_description())
 
@@ -431,7 +446,7 @@ class MainWindow(QMainWindow):
             for p, s in old_states:
                 p.status = s
             self._refresh_all()
-        self.undo_mgr.push(f"设置{len(old_states)}张照片为{new_status.value}", undo)
+        self.undo_mgr.push(f"设置{len(old_states)}张照片为{new_status.value}", undo, affected_count=len(old_states))
 
     def _push_undo_tags(self, photos: list, added_tags: list):
         old_states = [(p, list(p.tags)) for p in photos]
@@ -439,7 +454,7 @@ class MainWindow(QMainWindow):
             for p, old_tags in old_states:
                 p.tags = list(old_tags)
             self._refresh_all()
-        self.undo_mgr.push(f"为{len(photos)}张照片添加标签: {', '.join(added_tags)}", undo)
+        self.undo_mgr.push(f"为{len(photos)}张照片添加标签: {', '.join(added_tags)}", undo, affected_count=len(photos))
 
     def _push_undo_rename(self, rename_map: dict):
         def undo():
@@ -451,9 +466,9 @@ class MainWindow(QMainWindow):
                     if photo:
                         photo.file_path = Path(old_path)
                         photo.filename = Path(old_path).name
-                        self.store._photos[old_path] = self.store._photos.pop(new_path, photo)
+                        self.store._photos[str(old_path)] = self.store._photos.pop(str(new_path), photo)
             self._refresh_all()
-        self.undo_mgr.push(f"撤销{len(rename_map)}个文件重命名", undo)
+        self.undo_mgr.push(f"撤销{len(rename_map)}个文件重命名", undo, affected_count=len(rename_map))
 
     def _push_undo_move(self, move_map: dict):
         def undo():
@@ -466,9 +481,9 @@ class MainWindow(QMainWindow):
                     if photo:
                         photo.file_path = Path(old_path)
                         photo.filename = Path(old_path).name
-                        self.store._photos[old_path] = self.store._photos.pop(new_path, photo)
+                        self.store._photos[str(old_path)] = self.store._photos.pop(str(new_path), photo)
             self._refresh_all()
-        self.undo_mgr.push(f"撤销{len(move_map)}个文件移动", undo)
+        self.undo_mgr.push(f"撤销{len(move_map)}个文件移动", undo, affected_count=len(move_map))
 
     def _apply_rule(self, rule: HistoryRule):
         from PySide6.QtWidgets import QMessageBox
