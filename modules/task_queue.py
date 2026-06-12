@@ -270,6 +270,8 @@ class TaskWorker(QThread):
         total = len(photos)
         cancelled = False
         rows = []
+        temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+
         for i, photo in enumerate(photos):
             rows.append({
                 "文件名": photo.filename,
@@ -295,19 +297,34 @@ class TaskWorker(QThread):
                     rows = rows[:i + 1]
                     break
 
-        if rows:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            if format_type == "csv":
-                with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-                    writer.writeheader()
-                    writer.writerows(rows)
-            else:
-                with open(output_path, "w", encoding="utf-8") as f:
-                    json.dump(rows, f, ensure_ascii=False, indent=2)
+        if rows and not cancelled:
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                if format_type == "csv":
+                    with open(temp_path, "w", newline="", encoding="utf-8-sig") as f:
+                        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+                        writer.writeheader()
+                        writer.writerows(rows)
+                else:
+                    with open(temp_path, "w", encoding="utf-8") as f:
+                        json.dump(rows, f, ensure_ascii=False, indent=2)
+                temp_path.rename(output_path)
+            except Exception as e:
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except:
+                        pass
+                raise e
+        else:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except:
+                    pass
 
         return {
-            "manifest_path": str(output_path),
+            "manifest_path": str(output_path) if not cancelled and rows else "",
             "count": len(rows),
             "completed": completed,
             "skipped": skipped,
@@ -363,6 +380,7 @@ class TaskWorker(QThread):
     def _do_apply_tags(self) -> dict:
         tags = self.task.parameters.get("tags", [])
         photos = self.task.parameters.get("photos", [])
+        store = self.task.parameters.get("store")
         total = len(photos)
         completed = []
         skipped = []
@@ -378,11 +396,16 @@ class TaskWorker(QThread):
                 break
             old_tags = list(photo.tags)
             added = []
+            new_tags = list(photo.tags)
             for tag in tags:
-                if tag not in photo.tags:
-                    photo.tags.append(tag)
+                if tag not in new_tags:
+                    new_tags.append(tag)
                     added.append(tag)
             if added:
+                if store:
+                    store.update_photo_tags(photo, new_tags)
+                else:
+                    photo.tags = new_tags
                 completed.append({"filename": photo.filename, "added": added, "old_tags": old_tags, "new_tags": list(photo.tags)})
             else:
                 skipped.append(f"{photo.filename} (标签已存在)")

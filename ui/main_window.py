@@ -228,6 +228,7 @@ class MainWindow(QMainWindow):
         self.filter_panel.refresh_stats()
         self.filter_panel.refresh_tags()
         self.rename_tag_panel.refresh_tags()
+        self.detail_panel.refresh()
         self.lbl_count.setText(f"共 {self.store.count} 张照片 | 选中 {len(self.thumb_grid.selected_photos)} 张")
 
     def _apply_filter(self, filters: dict = None):
@@ -374,7 +375,7 @@ class MainWindow(QMainWindow):
             TaskType.APPLY_TAGS,
             f"添加标签 ({len(photos)}张)",
             f"标签: {', '.join(tags)}",
-            {"tags": tags, "photos": photos},
+            {"tags": tags, "photos": photos, "store": self.store},
             can_undo=True,
         )
         self._pending_undo[task.task_id] = {"type": "tags", "old_states": old_states, "tags": tags}
@@ -452,21 +453,21 @@ class MainWindow(QMainWindow):
         old_states = [(p, list(p.tags)) for p in photos]
         def undo():
             for p, old_tags in old_states:
-                p.tags = list(old_tags)
+                self.store.update_photo_tags(p, list(old_tags))
             self._refresh_all()
         self.undo_mgr.push(f"为{len(photos)}张照片添加标签: {', '.join(added_tags)}", undo, affected_count=len(photos))
 
     def _push_undo_rename(self, rename_map: dict):
         def undo():
+            from pathlib import Path
             for old_path, new_path in list(rename_map.items()):
-                from pathlib import Path
                 if Path(new_path).exists():
                     Path(new_path).rename(old_path)
                     photo = self.store.get_photo(new_path)
                     if photo:
                         photo.file_path = Path(old_path)
                         photo.filename = Path(old_path).name
-                        self.store._photos[str(old_path)] = self.store._photos.pop(str(new_path), photo)
+                        self.store.update_photo_path(photo, new_path, old_path)
             self._refresh_all()
         self.undo_mgr.push(f"撤销{len(rename_map)}个文件重命名", undo, affected_count=len(rename_map))
 
@@ -481,7 +482,7 @@ class MainWindow(QMainWindow):
                     if photo:
                         photo.file_path = Path(old_path)
                         photo.filename = Path(old_path).name
-                        self.store._photos[str(old_path)] = self.store._photos.pop(str(new_path), photo)
+                        self.store.update_photo_path(photo, new_path, old_path)
             self._refresh_all()
         self.undo_mgr.push(f"撤销{len(move_map)}个文件移动", undo, affected_count=len(move_map))
 
@@ -513,7 +514,7 @@ class MainWindow(QMainWindow):
             sub_tasks.append({
                 "task_type": TaskType.APPLY_TAGS,
                 "name": f"添加标签: {', '.join(rule.tags)}",
-                "parameters": {"tags": rule.tags, "photos": photos},
+                "parameters": {"tags": rule.tags, "photos": photos, "store": self.store},
             })
         if rule.rename_pattern:
             sub_tasks.append({
